@@ -1,16 +1,51 @@
 
-"""Extract official BU Dining menu items from previously downloaded HTML."""
+"""Download, extract, and validate official BU Dining menus for Terrier Trays.
 
+Install:
+    pip install requests beautifulsoup4
+
+Run:
+    python scripts/scrape_bu_menus.py
+
+Use cached HTML without downloading:
+    python scripts/scrape_bu_menus.py --offline
+
+Download fresh HTML:
+    python scripts/scrape_bu_menus.py --refresh
+
+The script uses official public pages only.
+
+Important safety rules:
+- Never invent missing nutritional information.
+- Never interpret missing allergen data as allergen-free.
+- Preserve food occurrences across dates, meals, and halls.
+- Preserve original HTML for verification.
+- Never publish an incomplete combined dataset as successful.
+"""
+
+import argparse
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+import hashlib
+import json
 from pathlib import Path
-import math
 import re
+import shutil
+import time
+from urllib import robotparser
 
 import requests
-
 from bs4 import BeautifulSoup, Tag
 
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+RAW_DIR = PROJECT_ROOT / "data" / "raw"
+OUTPUT_DIR = PROJECT_ROOT / "data" / "processed"
 
 DINING_HALL_URLS = {
     "West Campus": "https://www.bu.edu/dining/location/west/",
@@ -18,7 +53,29 @@ DINING_HALL_URLS = {
     "Marciano Commons": "https://www.bu.edu/dining/location/marciano/",
 }
 
-# Exact BU table labels -> (output key, required unit).
+HALL_SLUGS = {
+    "West Campus": "west",
+    "Warren Towers": "warren",
+    "Marciano Commons": "marciano",
+}
+
+# Select only real dining menu items.
+# This excludes WordPress navigation links that also use
+# the class "menu-item".
+MENU_ITEM_SELECTOR = (
+    "ol.js-menu-bydate li.menu-meal-period "
+    "ol.menu-dishes > li.menu-item"
+)
+
+MEAL_NAMES = {
+    "breakfast": "Breakfast",
+    "brunch": "Brunch",
+    "lunch": "Lunch",
+    "dinner": "Dinner",
+}
+
+# BU's exact nutrition labels.
+# Values are (output dictionary key, expected unit).
 NUTRIENTS = {
     "Calories": ("calories", ""),
     "Total Fat": ("total_fat_g", "g"),
@@ -39,18 +96,10 @@ VITAMINS = {
     "Iron": ("iron_dv", "%"),
 }
 
-MEAL_NAMES = {
-    "breakfast": "Breakfast",
-    "brunch": "Brunch",
-    "lunch": "Lunch",
-    "dinner": "Dinner",
-}
+NUMBER_RE = (
+    r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+"
+)
 
-NUMBER_RE = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+"
-
-# A warning overrides any apparent allergen list.
-# Some BU items display allergen labels while explicitly
-# stating that allergen data is unavailable.
 ALLERGEN_UNAVAILABLE_RE = re.compile(
     r"\ballergens?\s+(?:are|is)\s+"
     r"(?:not\s+available|unavailable|unknown)\b"
@@ -60,17 +109,37 @@ ALLERGEN_UNAVAILABLE_RE = re.compile(
 )
 
 NO_ALLERGENS_RE = re.compile(
-    r"\b(?:none\s+listed|no\s+(?:declared\s+)?allergens?\s*"
-    r"(?:listed|identified|declared)?)\b",
+    r"(?:none(?:\s+listed)?|no\s+(?:declared\s+)?allergens?\s*"
+    r"(?:listed|identified|declared)?)",
     re.IGNORECASE,
 )
 
+ALLERGY_NOTICE = (
+    "BU Dining warns that ingredient substitutions, formulation "
+    "changes, and kitchen cross-contact can occur. No menu item "
+    "is guaranteed allergen-free. Students with allergies should "
+    "consult BU Dining staff. A null allergens field means "
+    "unknown. An empty allergen list, when explicitly documented, "
+    "only means that BU lists no allergens."
+)
+
+USER_AGENT = "TerrierTrays/1.0 (educational menu research)"
+
+HTTP_TIMEOUT = (10, 35)
+
+# Minimum delay before each live dining-page request.
+REQUEST_DELAY_SECONDS = 2.0
+
+
+# ============================================================
+# TEXT AND HTML HELPERS
+# ============================================================
 
 def clean_text(tag):
     """
-    Return an element's stripped text.
+    Return the stripped text of an HTML element.
 
-    Returns None when the element is missing or empty.
+    Returns None if the element does not exist or is empty.
     """
     if tag is None:
         return None
@@ -80,40 +149,49 @@ def clean_text(tag):
 
 def own_matches(item, selector):
     """
-    Return matching elements belonging to this item.
+    Find matching descendants belonging to this exact food item.
 
-    Prevents accidentally extracting elements from a
-    hypothetically nested menu item.
+    This prevents accidentally taking information from another
+    nested li.menu-item element.
     """
     return [
         tag
         for tag in item.select(selector)
-        if tag.find_parent("li", class_="menu-item") is item
+        if tag.find_parent(
+            "li",
+            class_="menu-item"
+        ) is item
     ]
 
 
 def own_match(item, selector):
     """
-    Return the first matching element belonging to this item.
+    Return the first matching descendant belonging to this item.
     """
-    return next(iter(own_matches(item, selector)), None)
+    return next(
+        iter(own_matches(item, selector)),
+        None
+    )
 
+
+# ============================================================
+# NUMERICAL PARSING
+# ============================================================
 
 def parse_amount(raw, expected_unit):
     """
-    Parse a number with its expected unit.
+    Convert a nutritional value into an int or float.
 
     Examples:
-        "250"   -> 250       (expected_unit="")
-        "8g"    -> 8         (expected_unit="g")
-        "0.5g"  -> 0.5       (expected_unit="g")
-        "570mg" -> 570       (expected_unit="mg")
-        "23%"   -> 23        (expected_unit="%")
+        "250"   -> 250
+        "8g"    -> 8
+        "0.5g"  -> 0.5
+        "570mg" -> 570
+        "23%"   -> 23
 
-    Returns None if the value is missing, malformed,
-    or uses the wrong unit.
+    The supplied unit must match exactly.
 
-    Never assumes that a missing value is zero.
+    Missing or malformed values return None.
     """
     if raw is None:
         return None
@@ -132,9 +210,12 @@ def parse_amount(raw, expected_unit):
     if match is None:
         return None
 
-    number = float(match.group(1).replace(",", ""))
+    number = float(
+        match.group(1).replace(",", "")
+    )
 
-    if not math.isfinite(number):
+    # Reject negative, infinite, or invalid numbers.
+    if not (number >= 0 and number < float("inf")):
         return None
 
     if number.is_integer():
@@ -145,24 +226,25 @@ def parse_amount(raw, expected_unit):
 
 def read_nutrient_table(
     nutrition,
-    table_selector,
-    label_map,
-    amount_class
+    selector,
+    definitions,
+    value_class
 ):
     """
-    Extract nutrients from one specific nutrition table.
+    Extract nutrition values from a specific table.
 
-    Each nutrient label is associated with the adjacent
-    amount cell in the same table row.
+    Each nutrient label is paired with the amount cell
+    immediately following it.
 
-    Handles multiple nutrient/value pairs per row.
+    Handles multiple nutrient/value pairs in one row.
     """
     result = {}
+    conflicts = set()
 
     if nutrition is None:
         return result
 
-    table = nutrition.select_one(table_selector)
+    table = nutrition.select_one(selector)
 
     if table is None:
         return result
@@ -170,137 +252,167 @@ def read_nutrient_table(
     for label_cell in table.select(
         "td.nutrition-label-nutrient"
     ):
+
         label = clean_text(label_cell)
 
-        if label not in label_map:
+        if label not in definitions:
             continue
 
-        output_key, unit = label_map[label]
+        field, unit = definitions[label]
 
         value_cell = label_cell.find_next_sibling("td")
 
+        parsed = None
+
         if (
-            value_cell is None
-            or amount_class not in value_cell.get("class", [])
+            value_cell is not None
+            and value_class in value_cell.get("class", [])
         ):
-            parsed = None
-        else:
             parsed = parse_amount(
                 clean_text(value_cell),
                 unit
             )
 
-        # Conflicting duplicate labels must not produce
-        # an arbitrarily selected value.
-        if (
-            output_key in result
-            and result[output_key] != parsed
-        ):
-            result[output_key] = None
-        else:
-            result[output_key] = parsed
+        # If the same nutrient appears with conflicting
+        # values, do not arbitrarily choose one.
+        if field in result and result[field] != parsed:
+            conflicts.add(field)
+
+        elif field not in result:
+            result[field] = parsed
+
+    for field in conflicts:
+        result[field] = None
 
     return result
 
 
-def extract_allergens(nutrition):
+def iso_menu_date(value):
     """
-    Return documented allergens or None.
+    Validate an ISO-formatted YYYY-MM-DD date.
+    """
+    if not value:
+        return None
 
-    Returns:
-        list: Documented allergens.
-        []: Official source explicitly says none listed.
-        None: Allergens are missing or unavailable.
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return None
 
-    IMPORTANT:
-        None must never be interpreted as allergen-free.
-        Even [] does not guarantee protection from
-        substitutions or cross-contact.
+    try:
+        return date.fromisoformat(value).isoformat()
+
+    except ValueError:
+        return None
+
+
+# ============================================================
+# ALLERGEN EXTRACTION AND SAFETY
+# ============================================================
+
+def allergen_status(nutrition):
+    """
+    Determine the evidence status of allergen information.
+
+    This is used for diagnostics and safety.
+
+    An empty HTML allergen list is NOT evidence that
+    the food is allergen-free.
     """
     if nutrition is None:
-        return None
+        return "missing_nutrition_wrapper"
 
-    # An explicit unavailable-data warning overrides
-    # apparent allergen labels elsewhere in the wrapper.
     nutrition_text = clean_text(nutrition) or ""
 
+    # BU's explicit warning overrides apparent labels.
     if ALLERGEN_UNAVAILABLE_RE.search(nutrition_text):
-        return None
+        return "explicitly_unavailable"
 
     section = nutrition.select_one(
         ".nutrition-facts-allergens"
     )
 
     if section is None:
-        return None
+        return "missing_allergen_section"
 
     labels = [
-        clean_text(tag)
-        for tag in section.select("li")
+        clean_text(li)
+        for li in section.select("li")
     ]
 
-    # Remove empty labels and repeated labels.
-    labels = list(
+    labels = [
+        label
+        for label in labels
+        if label
+    ]
+
+    if labels:
+
+        declared_none = [
+            bool(NO_ALLERGENS_RE.fullmatch(label))
+            for label in labels
+        ]
+
+        if len(labels) == 1 and declared_none[0]:
+            return "explicitly_none_listed"
+
+        if any(declared_none):
+            return "ambiguous_allergen_labels"
+
+        return "allergens_listed"
+
+    section_text = clean_text(section) or ""
+
+    if NO_ALLERGENS_RE.fullmatch(section_text):
+        return "explicitly_none_listed"
+
+    # BU uses empty <ul> elements for many items.
+    # This is NOT proof that allergens are absent.
+    return "empty_allergen_list"
+
+
+def extract_allergens(nutrition):
+    """
+    Extract officially documented allergens.
+
+    Returns:
+        list -> allergen labels supplied by BU
+        []   -> explicitly documented as none listed
+        None -> missing, empty, ambiguous, or unavailable
+
+    Never infer that a food is allergy-safe.
+    """
+    status = allergen_status(nutrition)
+
+    if status == "explicitly_none_listed":
+        return []
+
+    if status != "allergens_listed":
+        return None
+
+    section = nutrition.select_one(
+        ".nutrition-facts-allergens"
+    )
+
+    labels = [
+        clean_text(li)
+        for li in section.select("li")
+    ]
+
+    return list(
         dict.fromkeys(
-            label for label in labels if label
+            label
+            for label in labels
+            if label
         )
     )
 
-    if labels:
-        # Explicitly documented absence of listed allergens.
-        if (
-            len(labels) == 1
-            and (
-                labels[0].lower() == "none"
-                or NO_ALLERGENS_RE.fullmatch(labels[0])
-            )
-        ):
-            return []
 
-        # Contradictory information is treated as unknown.
-        if any(
-            label.lower() == "none"
-            or NO_ALLERGENS_RE.fullmatch(label)
-            for label in labels
-        ):
-            return None
-
-        return labels
-
-    # An empty HTML list does not mean allergen-free.
-    section_text = clean_text(section) or ""
-
-    if (
-        section_text.lower() == "none"
-        or NO_ALLERGENS_RE.search(section_text)
-    ):
-        return []
-
-    return None
-
-
-def iso_menu_date(raw):
-    """
-    Validate an ISO-formatted YYYY-MM-DD date.
-
-    Returns None for missing or invalid dates.
-    """
-    if not raw:
-        return None
-
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
-        return None
-
-    try:
-        return date.fromisoformat(raw).isoformat()
-
-    except ValueError:
-        return None
-
+# ============================================================
+# EXTRACT AN INDIVIDUAL FOOD ITEM
+# ============================================================
 
 def extract_food_item(item, dining_hall):
     """
-    Extract a single official BU Dining food item.
+    Extract exactly one BU Dining food occurrence.
 
     Args:
         item:
@@ -310,30 +422,30 @@ def extract_food_item(item, dining_hall):
             Human-readable dining hall name.
 
     Returns:
-        Dictionary containing all available verified food
-        information, or None if the element is invalid.
+        Dictionary containing all 24 requested fields,
+        or None if the element is not a valid food item.
 
-    Notes:
-        Unknown values remain None.
-        Nutrition is extracted only from this item's wrapper.
-        Source URL is obtained from an official fixed mapping.
+    All missing nutrition values remain None.
     """
 
-    # Validate the dining hall.
     if dining_hall not in DINING_HALL_URLS:
         raise ValueError(
-            f"Unknown dining hall: {dining_hall!r}"
+            f"Unsupported dining hall: {dining_hall}"
         )
 
-    # Validate that we received a menu-item element.
-    if (
-        not isinstance(item, Tag)
-        or item.name != "li"
-        or "menu-item" not in item.get("class", [])
-    ):
+    if not isinstance(item, Tag):
         return None
 
-    # Extract the name from this specific item.
+    if item.name != "li":
+        return None
+
+    if "menu-item" not in item.get("class", []):
+        return None
+
+    # ------------------------------------------
+    # FOOD NAME
+    # ------------------------------------------
+
     name = clean_text(
         own_match(item, ".menu-item-title")
     )
@@ -341,14 +453,18 @@ def extract_food_item(item, dining_hall):
     if not name:
         return None
 
-    # Initialize every required field.
-    # Unknown values remain None.
+    # ------------------------------------------
+    # INITIALIZE THE COMPLETE RECORD
+    # ------------------------------------------
+
     food = {
         "name": name,
         "dining_hall": dining_hall,
+
         "station": clean_text(
             own_match(item, ".js-sortby-station")
         ),
+
         "meal": None,
         "date": None,
 
@@ -361,8 +477,10 @@ def extract_food_item(item, dining_hall):
         "total_fat_g": None,
         "saturated_fat_g": None,
         "trans_fat_g": None,
+
         "cholesterol_mg": None,
         "sodium_mg": None,
+
         "carbohydrates_g": None,
         "fiber_g": None,
         "sugars_g": None,
@@ -374,14 +492,16 @@ def extract_food_item(item, dining_hall):
         "iron_dv": None,
 
         "ingredients": None,
+
         "source_url": DINING_HALL_URLS[dining_hall],
     }
 
-    # -----------------------------------------
+    # ------------------------------------------
     # MEAL PERIOD
-    # -----------------------------------------
+    # ------------------------------------------
 
-    # Find the parent meal-period element.
+    # Walk upward from this food item to the nearest
+    # enclosing meal-period element.
     meal_parent = item.find_parent(
         "li",
         class_="menu-meal-period"
@@ -401,11 +521,11 @@ def extract_food_item(item, dining_hall):
 
                 break
 
-    # -----------------------------------------
-    # MENU DATE
-    # -----------------------------------------
+    # ------------------------------------------
+    # DATE
+    # ------------------------------------------
 
-    # Find the enclosing date container.
+    # Locate the date container containing this item.
     date_parent = item.find_parent(
         "ol",
         class_="js-menu-bydate"
@@ -417,13 +537,13 @@ def extract_food_item(item, dining_hall):
             date_parent.get("data-menudate")
         )
 
-    # -----------------------------------------
+    # ------------------------------------------
     # DIETARY TAGS
-    # -----------------------------------------
+    # ------------------------------------------
 
     dietary_labels = [
-        clean_text(tag)
-        for tag in own_matches(
+        clean_text(li)
+        for li in own_matches(
             item,
             ".menu-item-dietary-restriction li"
         )
@@ -431,33 +551,35 @@ def extract_food_item(item, dining_hall):
 
     food["dietary_tags"] = list(
         dict.fromkeys(
-            label for label in dietary_labels if label
+            label
+            for label in dietary_labels
+            if label
         )
     )
 
-    # -----------------------------------------
-    # NUTRITION WRAPPER
-    # -----------------------------------------
+    # ------------------------------------------
+    # FIND THIS ITEM'S NUTRITION WRAPPER
+    # ------------------------------------------
 
-    # Locate nutrition ONLY inside this food item.
     nutrition = own_match(
         item,
         ".nutrition-wrapper"
     )
 
-    # Missing nutrition does not invalidate the item.
+    # Missing nutrition does not invalidate a real
+    # food item. Retain it with unknown values.
     if nutrition is None:
         return food
 
-    # -----------------------------------------
+    # ------------------------------------------
     # ALLERGENS
-    # -----------------------------------------
+    # ------------------------------------------
 
     food["allergens"] = extract_allergens(nutrition)
 
-    # -----------------------------------------
+    # ------------------------------------------
     # SERVING SIZE
-    # -----------------------------------------
+    # ------------------------------------------
 
     serving = clean_text(
         nutrition.select_one(
@@ -468,7 +590,7 @@ def extract_food_item(item, dining_hall):
     if serving:
 
         serving = re.sub(
-            r"^Serving\s+size\s*:?[ \t]*",
+            r"^Serving\s+size\s*:?\s*",
             "",
             serving,
             flags=re.IGNORECASE
@@ -476,9 +598,9 @@ def extract_food_item(item, dining_hall):
 
         food["serving_size"] = serving or None
 
-    # -----------------------------------------
+    # ------------------------------------------
     # INGREDIENTS
-    # -----------------------------------------
+    # ------------------------------------------
 
     ingredients = clean_text(
         nutrition.select_one(
@@ -497,9 +619,9 @@ def extract_food_item(item, dining_hall):
 
         food["ingredients"] = ingredients or None
 
-    # -----------------------------------------
-    # MAIN NUTRIENTS
-    # -----------------------------------------
+    # ------------------------------------------
+    # MAIN NUTRIENT TABLE
+    # ------------------------------------------
 
     nutrient_values = read_nutrient_table(
         nutrition,
@@ -510,9 +632,9 @@ def extract_food_item(item, dining_hall):
 
     food.update(nutrient_values)
 
-    # -----------------------------------------
-    # VITAMINS / MINERALS (% DAILY VALUE)
-    # -----------------------------------------
+    # ------------------------------------------
+    # VITAMINS / MINERALS
+    # ------------------------------------------
 
     vitamin_values = read_nutrient_table(
         nutrition,
@@ -526,330 +648,934 @@ def extract_food_item(item, dining_hall):
     return food
 
 
+# ============================================================
+# EXTRACT ALL FOOD ITEMS FROM ONE HALL
+# ============================================================
+
 def extract_all_with_diagnostics(soup, dining_hall):
     """
-    Extract all menu-item occurrences from one HTML document.
+    Extract all food occurrences from one dining hall.
 
-    Preserves duplicate names across dates and meal periods.
+    Uses a food-specific selector that excludes navigation
+    links and unrelated WordPress menu elements.
+
+    Does not deduplicate foods by name.
 
     Returns:
-        records: List of valid food dictionaries.
-        report: Extraction diagnostics and missing-data counts.
+        records: list of extracted food dictionaries
+        report: diagnostic information
     """
 
-    records = []
-    invalid = 0
-    failures = []
-    missing_wrappers = 0
+    items = soup.select(MENU_ITEM_SELECTOR)
 
-    items = soup.select("li.menu-item")
+    records = []
+    failures = []
+
+    invalid = 0
+    absent_wrappers = 0
+
+    statuses = Counter()
 
     for index, item in enumerate(items, start=1):
 
         try:
-            if own_match(item, ".nutrition-wrapper") is None:
-                missing_wrappers += 1
 
-            record = extract_food_item(
+            nutrition = own_match(
+                item,
+                ".nutrition-wrapper"
+            )
+
+            if nutrition is None:
+                absent_wrappers += 1
+
+            food = extract_food_item(
                 item,
                 dining_hall
             )
 
+            if food is None:
+                invalid += 1
+                continue
+
+            records.append(food)
+
+            statuses[
+                allergen_status(nutrition)
+            ] += 1
+
         except Exception as exc:
-            failures.append(
-                (index, repr(exc))
-            )
-            continue
 
-        if record is None:
-            invalid += 1
+            failures.append({
+                "item_index": index,
+                "error": repr(exc),
+            })
 
-        else:
-            # Never deduplicate by food name.
-            records.append(record)
+    # Count unknown values in each field.
+    missing = Counter(
+        field
+        for record in records
+        for field, value in record.items()
+        if value is None
+    )
 
-    # Count missing fields across all valid records.
-    missing = Counter()
+    # Count occurrences by date and meal.
+    occurrence_counts = Counter(
+        f"{record['date']} | {record['meal']}"
+        for record in records
+    )
 
-    for record in records:
+    dates = sorted({
+        record["date"]
+        for record in records
+        if record["date"]
+    })
 
-        missing.update(
-            key
-            for key, value in record.items()
-            if value is None
+    nutrient_fields = [
+        field
+        for field, unit in NUTRIENTS.values()
+    ]
+
+    complete_nutrition = sum(
+        all(
+            record[field] is not None
+            for field in nutrient_fields
         )
-
-    # Count records by date and meal.
-    date_meal_counts = Counter(
-        (row["date"], row["meal"])
-        for row in records
+        for record in records
     )
 
     report = {
+        "dining_hall": dining_hall,
+
+        "source_url": DINING_HALL_URLS[dining_hall],
+
         "items_seen": len(items),
+
         "valid_records": len(records),
+
         "invalid_records": invalid,
+
         "extraction_failures": failures,
-        "items_without_nutrition_wrapper": missing_wrappers,
+
+        "items_without_nutrition_wrapper": absent_wrappers,
+
+        "records_with_complete_core_nutrients": complete_nutrition,
+
         "missing_field_counts": dict(
-            missing.most_common()
+            sorted(missing.items())
         ),
+
+        "allergen_status_counts": dict(
+            sorted(statuses.items())
+        ),
+
+        "dates": dates,
+
         "occurrences_by_date_meal": dict(
-            date_meal_counts
+            sorted(occurrence_counts.items())
         ),
+
+        "errors": [],
+        "warnings": [],
     }
 
     return records, report
 
 
-# =================================================
-# MAIN EXECUTION
-# =================================================
+# ============================================================
+# VALIDATE EACH DINING HALL
+# ============================================================
 
-if __name__ == "__main__":
+def validate_hall(
+    soup,
+    records,
+    report,
+    dining_hall
+):
+    """
+    Validate the scraped data for a single dining hall.
 
-    # Load an already downloaded official BU HTML snapshot.
-    # Keep the original raw HTML for provenance.
-    
-    # Get the project root regardless of terminal location.
-    project_root = Path(__file__).resolve().parent.parent
+    Critical errors prevent publication of the combined
+    dataset.
 
-    # Where we will save the downloaded HTML.
-    html_path = project_root / "data" / "raw" / "west_2026-11-07.html"
+    Missing individual nutrition values cause warnings,
+    not deletion of otherwise valid food records.
+    """
 
-    # Create directories if they don't exist.
-    html_path.parent.mkdir(parents=True, exist_ok=True)
+    # Verify that the HTML identifies the intended hall.
+    page_titles = [
+        clean_text(element) or ""
+        for element in soup.select("h1, title")
+    ]
 
-    # Only download if we don't already have the file.
-    if not html_path.exists():
+    if not any(
+        dining_hall.lower() in title.lower()
+        for title in page_titles
+    ):
 
-        print("Downloading West Campus menu...")
-
-        url = DINING_HALL_URLS["West Campus"]
-
-        response = requests.get(
-            url,
-            timeout=20,
-            headers={
-                "User-Agent": "TerrierTrays/1.0 (educational project)"
-            }
+        report["errors"].append(
+            "Page title does not identify the intended dining hall."
         )
 
-        response.raise_for_status()
+    # Check that menu items were found.
+    if not report["items_seen"] or not records:
 
-        # Save the original HTML for future use.
-        html_path.write_bytes(response.content)
+        report["errors"].append(
+            "No recognizable dining menu items found."
+        )
 
-        print("HTML downloaded and saved!")
+    # Extraction exceptions require investigation.
+    if report["extraction_failures"]:
+
+        report["errors"].append(
+            "One or more food-item extraction exceptions occurred."
+        )
+
+    # Individual invalid elements are reported.
+    if report["invalid_records"]:
+
+        report["warnings"].append(
+            "Some dining menu elements lacked food names."
+        )
+
+    # Every record must have a verified date and meal.
+    if any(
+        record["date"] is None
+        or record["meal"] is None
+        for record in records
+    ):
+
+        report["errors"].append(
+            "At least one record lacks a valid date or meal period."
+        )
+
+    # Verify every record's official source.
+    if any(
+        record["source_url"] != DINING_HALL_URLS[dining_hall]
+        for record in records
+    ):
+
+        report["errors"].append(
+            "At least one source URL does not match its dining hall."
+        )
+
+    # Verify seven menu dates.
+    dates = report["dates"]
+
+    if len(dates) != 7:
+
+        report["errors"].append(
+            f"Expected 7 menu dates, found {len(dates)}: {dates}"
+        )
 
     else:
-        print("Using previously downloaded HTML.")
 
-    # Parse the HTML.
-    soup = BeautifulSoup(
-        html_path.read_bytes(),
-        "html.parser"
-    )
+        first_date = date.fromisoformat(dates[0])
 
-    print("HTML successfully loaded!")
+        expected_dates = [
+            first_date + timedelta(days=i)
+            for i in range(7)
+        ]
 
+        actual_dates = [
+            date.fromisoformat(value)
+            for value in dates
+        ]
 
-    # Extract every food item.
-    food_items, diagnostic_report = (
-        extract_all_with_diagnostics(
-            soup,
-            "West Campus"
+        if actual_dates != expected_dates:
+
+            report["errors"].append(
+                "Menu dates are not seven consecutive days."
+            )
+
+    # Missing nutrition is reported, not invented.
+    missing = report["missing_field_counts"]
+
+    if missing.get("calories", 0):
+
+        report["warnings"].append(
+            f"{missing['calories']} records have unknown calories."
         )
+
+    if missing.get("allergens", 0):
+
+        report["warnings"].append(
+            f"{missing['allergens']} records have unknown allergens. "
+            "These records must not be treated as allergy-safe."
+        )
+
+    return not report["errors"]
+
+
+# ============================================================
+# RESPONSIBLE DOWNLOADING
+# ============================================================
+
+def read_robots(session):
+    """
+    Retrieve and parse BU's robots.txt.
+
+    Stops scraping if a robots.txt request fails,
+    except when the file is explicitly not found.
+    """
+    robots_url = "https://www.bu.edu/robots.txt"
+
+    response = session.get(
+        robots_url,
+        timeout=HTTP_TIMEOUT
     )
 
-    # Print diagnostic information.
-    for key, value in diagnostic_report.items():
-        print(key, ":", value)
+    if response.status_code == 404:
 
-    # -----------------------------------------
-    # CLASSIC CHEESE PIZZA REGRESSION TEST
-    # -----------------------------------------
+        print(
+            "robots.txt returned HTTP 404. "
+            "Review BU's website usage restrictions."
+        )
 
-    # Find the specific pizza occurrence.
-    pizza = next(
-        (
-            food
-            for food in food_items
-            if food["name"] == "Classic Cheese Pizza"
-            and food["date"] == "2026-11-07"
-            and food["meal"] == "Lunch"
-            and food["station"] == "Brick Oven"
-        ),
-        None
+        return None
+
+    response.raise_for_status()
+
+    parser = robotparser.RobotFileParser()
+
+    parser.parse(
+        response.text.splitlines()
     )
 
-    assert pizza is not None, (
-        "Expected pizza occurrence not found in snapshot"
+    return parser
+
+
+def write_bytes_atomically(path, content):
+    """
+    Save bytes safely using a temporary file.
+
+    Replace the destination only after writing succeeds.
+    """
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True
     )
 
-    expected = {
-        "name": "Classic Cheese Pizza",
-        "dining_hall": "West Campus",
-        "station": "Brick Oven",
-        "meal": "Lunch",
-        "date": "2026-11-07",
+    temporary = path.with_suffix(
+        path.suffix + ".tmp"
+    )
 
-        "dietary_tags": ["Vegetarian", "Halal"],
-        "allergens": ["Milk", "Soy", "Wheat"],
+    temporary.write_bytes(content)
 
-        "serving_size": "1/8 cut",
-        "calories": 250,
+    temporary.replace(path)
 
-        "total_fat_g": 8,
-        "saturated_fat_g": 4,
-        "trans_fat_g": 0,
-        "cholesterol_mg": 18,
-        "sodium_mg": 570,
-        "carbohydrates_g": 34,
-        "fiber_g": 2,
-        "sugars_g": 3,
-        "protein_g": 12,
 
-        "vitamin_d_dv": 23,
-        "potassium_dv": 5,
-        "calcium_dv": 16,
-        "iron_dv": 13,
+def write_json(path, value):
+    """
+    Write readable, UTF-8 JSON.
+    """
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False
+    )
+
+    write_bytes_atomically(
+        path,
+        (payload + "\n").encode("utf-8")
+    )
+
+
+def read_or_fetch_html(
+    hall,
+    snapshot_date,
+    session,
+    offline,
+    refresh,
+    robot_state
+):
+    """
+    Obtain one dining hall's official HTML.
+
+    Uses cached raw HTML when available.
+
+    --offline:
+        Never make HTTP requests.
+
+    --refresh:
+        Download new HTML and back up an older snapshot.
+
+    Returns:
+        html bytes, snapshot file path
+    """
+
+    slug = HALL_SLUGS[hall]
+
+    path = RAW_DIR / f"{slug}_{snapshot_date}.html"
+
+    # Reuse the snapshot if available.
+    if path.exists() and not refresh:
+
+        print(
+            f"[{hall}] Using cached HTML: {path.name}"
+        )
+
+        return path.read_bytes(), path
+
+    if offline:
+
+        raise FileNotFoundError(
+            f"No cached HTML for {hall}: {path}"
+        )
+
+    # Only check robots.txt once per run.
+    if not robot_state["checked"]:
+
+        robot_state["parser"] = read_robots(session)
+
+        robot_state["checked"] = True
+
+    robots = robot_state["parser"]
+
+    url = DINING_HALL_URLS[hall]
+
+    if robots is not None:
+
+        if not robots.can_fetch(USER_AGENT, url):
+
+            raise PermissionError(
+                f"robots.txt does not permit fetching {url}"
+            )
+
+    # Respect configured minimum request delay
+    # and any robots.txt crawl delay.
+    delay = REQUEST_DELAY_SECONDS
+
+    if robots is not None:
+
+        delay = max(
+            delay,
+            robots.crawl_delay(USER_AGENT) or 0
+        )
+
+    time.sleep(delay)
+
+    print(f"[{hall}] Downloading {url}")
+
+    response = session.get(
+        url,
+        timeout=HTTP_TIMEOUT
+    )
+
+    response.raise_for_status()
+
+    # Prevent unexpectedly redirected content from
+    # being treated as official dining hall data.
+    if not response.url.startswith(
+        "https://www.bu.edu/dining/location/"
+    ):
+
+        raise ValueError(
+            f"Unexpected redirect for {hall}: {response.url}"
+        )
+
+    html = response.content
+
+    if not html:
+
+        raise ValueError(
+            f"Empty HTML response for {hall}"
+        )
+
+    # Preserve a previous snapshot during refresh.
+    if path.exists():
+
+        suffix = datetime.now(
+            timezone.utc
+        ).strftime("%H%M%S%f")
+
+        backup = path.with_name(
+            f"{path.stem}_previous_{suffix}.html"
+        )
+
+        shutil.copy2(path, backup)
+
+        print(
+            f"[{hall}] Previous HTML backed up: "
+            f"{backup.name}"
+        )
+
+    write_bytes_atomically(path, html)
+
+    print(f"[{hall}] HTML saved.")
+
+    return html, path
+
+
+# ============================================================
+# DATA PROVENANCE
+# ============================================================
+
+def source_metadata(path, html, hall):
+    """
+    Record the origin of every hall's downloaded HTML.
+
+    SHA-256 allows future verification that the raw
+    HTML has not changed.
+    """
+    return {
+        "url": DINING_HALL_URLS[hall],
+
+        "raw_html_path": path.relative_to(
+            PROJECT_ROOT
+        ).as_posix(),
+
+        "raw_html_sha256": hashlib.sha256(
+            html
+        ).hexdigest(),
+
+        "file_saved_at_utc": datetime.fromtimestamp(
+            path.stat().st_mtime,
+            timezone.utc
+        ).isoformat(),
     }
 
-    for key, expected_value in expected.items():
 
-        assert pizza[key] == expected_value, (
-            key,
-            pizza[key],
-            expected_value
+# ============================================================
+# PRINT DIAGNOSTICS
+# ============================================================
+
+def print_hall_summary(report):
+    """
+    Print a concise summary for a dining hall.
+    """
+    print(
+        f"\n[{report['dining_hall']}]"
+    )
+
+    print(
+        "Food records:",
+        report["valid_records"]
+    )
+
+    print(
+        "Selected menu items:",
+        report["items_seen"]
+    )
+
+    print(
+        "Menu dates:",
+        len(report["dates"])
+    )
+
+    print(
+        "Complete core nutrition:",
+        report["records_with_complete_core_nutrients"]
+    )
+
+    print(
+        "Unknown calories:",
+        report["missing_field_counts"].get(
+            "calories",
+            0
+        )
+    )
+
+    print(
+        "Unknown allergens:",
+        report["missing_field_counts"].get(
+            "allergens",
+            0
+        )
+    )
+
+    print("\nAllergen information status:")
+
+    for status, count in report[
+        "allergen_status_counts"
+    ].items():
+
+        print(f"  {status}: {count}")
+
+    for error in report.get("errors", []):
+
+        print(f"ERROR: {error}")
+
+    for warning in report.get("warnings", []):
+
+        print(f"NOTE: {warning}")
+
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+
+def main():
+    """
+    Download or load all three halls, extract food data,
+    validate each hall, and generate a combined dataset.
+    """
+
+    parser = argparse.ArgumentParser(
+        description=__doc__
+    )
+
+    parser.add_argument(
+        "--snapshot-date",
+
+        default=date.today().isoformat(),
+
+        help=(
+            "Cache/output file label (YYYY-MM-DD). "
+            "Actual food dates are read from BU HTML."
+        )
+    )
+
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use saved HTML only."
+    )
+
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Download fresh HTML and back up old files."
+    )
+
+    args = parser.parse_args()
+
+    if args.offline and args.refresh:
+
+        parser.error(
+            "--offline and --refresh cannot be used together"
         )
 
-    assert pizza["ingredients"], (
-        "Ingredient text was not extracted"
+    snapshot_date = iso_menu_date(
+        args.snapshot_date
     )
 
-    assert pizza["source_url"] == (
-        DINING_HALL_URLS["West Campus"]
+    if snapshot_date is None:
+
+        parser.error(
+            "--snapshot-date must be a valid YYYY-MM-DD date"
+        )
+
+    print("=" * 60)
+    print("TERRIER TRAYS — BU DINING MENU SCRAPER")
+    print("=" * 60)
+
+    print(
+        "\nReview BU's website usage restrictions "
+        "before live scraping."
     )
 
-    print("Pizza regression test passed")
-
-
-from collections import Counter
-
-allergen_reasons = Counter()
-
-for item in soup.select("li.menu-item"):
-
-    food = extract_food_item(item, "West Campus")
-
-    if food is None:
-        continue
-
-    if food["allergens"] is not None:
-        continue
-
-    nutrition = own_match(item, ".nutrition-wrapper")
-
-    if nutrition is None:
-        reason = "Missing nutrition wrapper"
-
-    elif ALLERGEN_UNAVAILABLE_RE.search(
-        clean_text(nutrition) or ""
-    ):
-        reason = "BU explicitly says allergens unavailable"
-
-    elif nutrition.select_one(
-        ".nutrition-facts-allergens"
-    ) is None:
-        reason = "No allergen section"
-
-    else:
-        reason = "Allergen section present but unrecognized"
-
-    allergen_reasons[reason] += 1
-
-print("\nALLERGEN DIAGNOSTICS:")
-
-for reason, count in allergen_reasons.items():
-    print(f"{reason}: {count}")
-
-
-# ==========================================
-# INSPECT UNRECOGNIZED ALLERGEN SECTIONS
-# ==========================================
-
-from collections import Counter
-
-unrecognized = []
-
-for item in soup.select("li.menu-item"):
-
-    food = extract_food_item(item, "West Campus")
-
-    if food is None or food["allergens"] is not None:
-        continue
-
-    nutrition = own_match(item, ".nutrition-wrapper")
-
-    if nutrition is None:
-        continue
-
-    if ALLERGEN_UNAVAILABLE_RE.search(
-        clean_text(nutrition) or ""
-    ):
-        continue
-
-    section = nutrition.select_one(
-        ".nutrition-facts-allergens"
+    print(
+        "Allergen information is not a guarantee "
+        "of allergy safety.\n"
     )
 
-    if section is None:
-        continue
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    unrecognized.append({
-        "name": food["name"],
-        "date": food["date"],
-        "meal": food["meal"],
-        "text": clean_text(section) or "[EMPTY]",
-        "html": str(section)
+    # Track robots.txt checking across all halls.
+    robot_state = {
+        "checked": False,
+        "parser": None,
+    }
+
+    reports = {}
+    sources = {}
+    by_hall = {}
+
+    session = requests.Session()
+
+    session.headers.update({
+        "User-Agent": USER_AGENT
     })
 
+    # ------------------------------------------
+    # SCRAPE EACH HALL
+    # ------------------------------------------
 
-print("\nTOTAL UNRECOGNIZED:", len(unrecognized))
+    try:
 
-# Group sections by their displayed text.
-text_counts = Counter(
-    record["text"]
-    for record in unrecognized
-)
+        for hall in DINING_HALL_URLS:
 
-print("\nMOST COMMON SECTION TEXT:")
+            print("\n" + "-" * 60)
+            print("PROCESSING:", hall)
+            print("-" * 60)
 
-for text, count in text_counts.most_common(10):
-    print(f"{count} occurrences: {text[:200]}")
+            try:
+
+                html, path = read_or_fetch_html(
+                    hall,
+                    snapshot_date,
+                    session,
+                    args.offline,
+                    args.refresh,
+                    robot_state
+                )
+
+                soup = BeautifulSoup(
+                    html,
+                    "html.parser"
+                )
+
+                records, report = (
+                    extract_all_with_diagnostics(
+                        soup,
+                        hall
+                    )
+                )
+
+                validate_hall(
+                    soup,
+                    records,
+                    report,
+                    hall
+                )
+
+                reports[hall] = report
+
+                sources[hall] = source_metadata(
+                    path,
+                    html,
+                    hall
+                )
+
+                by_hall[hall] = records
+
+                print_hall_summary(report)
+
+            except (
+                requests.RequestException,
+                OSError,
+                ValueError
+            ) as exc:
+
+                reports[hall] = {
+                    "dining_hall": hall,
+                    "errors": [
+                        f"Fetch or parse failed: {exc}"
+                    ],
+                    "warnings": [],
+                }
+
+                print(
+                    f"[{hall}] ERROR: {exc}"
+                )
+
+    finally:
+
+        session.close()
+
+    # ------------------------------------------
+    # CROSS-HALL VALIDATION
+    # ------------------------------------------
+
+    errors = [
+        hall
+        for hall, report in reports.items()
+        if report["errors"]
+    ]
+
+    # Verify all three halls contain the same dates.
+    if not errors:
+
+        date_sets = [
+            set(reports[hall]["dates"])
+            for hall in DINING_HALL_URLS
+        ]
+
+        first_dates = date_sets[0]
+
+        if not all(
+            dates == first_dates
+            for dates in date_sets[1:]
+        ):
+
+            errors.append(
+                "Cross-hall date mismatch"
+            )
+
+            print(
+                "\nERROR: Dining halls do not "
+                "cover the same seven dates."
+            )
+
+    # ------------------------------------------
+    # SAVE VALIDATION REPORT
+    # ------------------------------------------
+
+    validation = {
+        "snapshot_date": snapshot_date,
+
+        "generated_at_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
+
+        "status": (
+            "failed"
+            if errors
+            else "passed"
+        ),
+
+        "failed_halls_or_checks": errors,
+
+        "halls": reports,
+    }
+
+    validation_path = (
+        OUTPUT_DIR
+        / f"validation_{snapshot_date}.json"
+    )
+
+    write_json(
+        validation_path,
+        validation
+    )
+
+    # Do not publish a new combined dataset
+    # if one or more halls fail validation.
+    if errors:
+
+        print("\n" + "=" * 60)
+        print("VALIDATION FAILED")
+        print("=" * 60)
+
+        print(
+            "Diagnostics saved to:",
+            validation_path
+        )
+
+        print(
+            "No new combined dataset was published."
+        )
+
+        return 1
+
+    # ------------------------------------------
+    # COMBINE ALL THREE HALLS
+    # ------------------------------------------
+
+    # Do not deduplicate by name.
+    # The same food can appear in several halls,
+    # meals, or dates.
+    all_records = [
+        record
+        for hall in DINING_HALL_URLS
+        for record in by_hall[hall]
+    ]
+
+    menu_dates = reports[
+        "West Campus"
+    ]["dates"]
+
+    # ------------------------------------------
+    # SAVE INDIVIDUAL HALL DATASETS
+    # ------------------------------------------
+
+    for hall, records in by_hall.items():
+
+        path = (
+            OUTPUT_DIR
+            / f"{HALL_SLUGS[hall]}_{snapshot_date}.json"
+        )
+
+        write_json(
+            path,
+            records
+        )
+
+        print(
+            f"\nSaved {len(records)} records "
+            f"for {hall}: {path}"
+        )
+
+    # ------------------------------------------
+    # BUILD COMBINED DATASET
+    # ------------------------------------------
+
+    combined = {
+        "schema_version": "1.0",
+
+        "generated_at_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
+
+        "snapshot_date": snapshot_date,
+
+        "menu_dates": menu_dates,
+
+        "dining_halls": list(
+            DINING_HALL_URLS
+        ),
+
+        "total_records": len(all_records),
+
+        "allergy_notice": ALLERGY_NOTICE,
+
+        "sources": sources,
+
+        "records": all_records,
+    }
+
+    # ------------------------------------------
+    # SAVE COMBINED JSON
+    # ------------------------------------------
+
+    combined_path = (
+        OUTPUT_DIR
+        / f"terrier_trays_menus_{snapshot_date}.json"
+    )
+
+    write_json(
+        combined_path,
+        combined
+    )
+
+    # ------------------------------------------
+    # FINAL RESULTS
+    # ------------------------------------------
+
+    print("\n" + "=" * 60)
+    print("TERRIER TRAYS — EXTRACTION COMPLETE")
+    print("=" * 60)
+
+    for hall in DINING_HALL_URLS:
+
+        print(
+            f"{hall}: "
+            f"{len(by_hall[hall])} records"
+        )
+
+    print(
+        "\nTotal food occurrences:",
+        len(all_records)
+    )
+
+    print(
+        "Menu dates:",
+        menu_dates[0],
+        "through",
+        menu_dates[-1]
+    )
+
+    print(
+        "\nCombined dataset:",
+        combined_path
+    )
+
+    print(
+        "Validation report:",
+        validation_path
+    )
+
+    print(
+        "\nReminder: Unknown allergens must never "
+        "be treated as safe for allergies."
+    )
+
+    return 0
 
 
-# Show examples of different HTML structures.
-print("\nHTML EXAMPLES:")
-
-seen = set()
-
-for record in unrecognized:
-
-    signature = record["text"]
-
-    if signature in seen:
-        continue
-
-    seen.add(signature)
-
-    print("\n-------------------------")
-    print("FOOD:", record["name"])
-    print("DATE:", record["date"])
-    print("MEAL:", record["meal"])
-    print("SECTION HTML:")
-    print(record["html"][:1200])
-
-    if len(seen) >= 5:
-        break
+if __name__ == "__main__":
+    raise SystemExit(main())
