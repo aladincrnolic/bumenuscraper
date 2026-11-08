@@ -157,20 +157,29 @@ jobs:
       - name: Remove archives older than 30 days
         run: python scripts/cleanup_archives.py --retention-days 30 --delete
 
+
       - name: Commit validated menus and retained archives
         shell: bash
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-          # -f allows these paths even when listed in .gitignore.
-          # Do not stage data/staging/ or unvalidated temporary files.
+          # Stage validated data and archive changes.
           git add -f -- data/current/menus.json
           git add -A -f -- data/archive/
 
           if git diff --cached --quiet; then
-            echo 'No menu or archive changes to publish.'
+            echo "No menu or archive changes to publish."
           else
             git commit -m "chore: update validated BU menus (${{ steps.menu-date.outputs.snapshot_date }})"
+
+            # Retrieve updates made while the scraper was running.
+            git fetch origin "${GITHUB_REF_NAME}"
+
+            # Apply our new commit on top of the latest main.
+            git rebase "origin/${GITHUB_REF_NAME}"
+
+            # Push without overwriting other people's commits.
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
+
