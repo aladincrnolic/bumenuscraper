@@ -120,10 +120,32 @@ jobs:
           started = datetime.fromisoformat(os.environ['STARTED_AT_UTC'])
           if generated.tzinfo is None or generated < started:
               sys.exit('ERROR: Menu dataset was not freshly generated.')
-
+       
           first_day = date.fromisoformat(snapshot_date)
-          dates = [(first_day + timedelta(days=offset)).isoformat()
-                   for offset in range(7)]
+          available_dates = {
+              date.fromisoformat(day)
+              for day in dataset.get("menu_dates", [])
+          }
+
+          if first_day not in available_dates:
+              sys.exit("ERROR: Today's menu is unavailable.")
+
+          last_day = min(
+              max(available_dates),
+              first_day + timedelta(days=6)
+          )
+
+          dates = [
+              (first_day + timedelta(days=offset)).isoformat()
+              for offset in range((last_day - first_day).days + 1)
+          ]
+
+          if len(dates) < 7:
+              print(
+                  f"WARNING: Only {len(dates)} days are available "
+                  "starting today. A full 7-day plan is unavailable."
+              )
+
           print('Validating menu dates:', ', '.join(dates))
           subprocess.run(
               [sys.executable, 'scripts/validate_freshness.py',
