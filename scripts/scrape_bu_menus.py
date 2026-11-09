@@ -1011,6 +1011,10 @@ def main():
     ]
 
     if not failures:
+        
+        for hall in DINING_HALL_URLS:
+            dates = sorted(set(reports[hall]["dates"]))
+            print(f"  {hall} menu dates: {', '.join(dates) or '(none)'}")
 
         date_sets = [
             set(reports[hall]["dates"])
